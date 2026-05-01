@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: immo-bot
+  cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -15,6 +19,12 @@ jobs:
     steps:
       - name: Repository laden
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Aktuellen Stand holen
+        run: |
+          git pull --rebase origin main
 
       - name: Python installieren
         uses: actions/setup-python@v5
@@ -42,6 +52,15 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add seen_ads.json today_deals.json last_summary.txt || true
-          git diff --staged --quiet || git commit -m "Update immo bot cache"
-          git push || true
+
+          git pull --rebase origin main
+
+          git add seen_ads.json today_deals.json || true
+          if [ -f last_summary.txt ]; then git add last_summary.txt; fi
+
+          if git diff --staged --quiet; then
+            echo "Keine Änderungen zu speichern."
+          else
+            git commit -m "Update immo bot cache"
+            git push origin main
+          fi
