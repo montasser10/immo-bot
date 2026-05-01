@@ -382,7 +382,36 @@ def normalize_url_for_id(url):
 
     url = url.replace("&amp;", "&")
     url = url.split("#")[0]
-    url = url.split("?")[0]
+
+    if "?" in url:
+        base, query = url.split("?", 1)
+        useful_params = []
+
+        for part in query.split("&"):
+            lower = part.lower()
+
+            if lower.startswith((
+                "utm_",
+                "tracking",
+                "ref",
+                "referrer",
+                "newsletter",
+                "email",
+                "cid",
+                "mc_",
+                "sc_",
+                "cmp",
+                "campaign"
+            )):
+                continue
+
+            useful_params.append(part)
+
+        if useful_params:
+            url = base + "?" + "&".join(useful_params)
+        else:
+            url = base
+
     url = url.rstrip("/")
 
     return url
@@ -527,21 +556,34 @@ def extract_ad_id_from_url(url):
         return None
 
     clean_url = normalize_url_for_id(url)
+    lower = clean_url.lower()
+
+    patterns = [
+        r"/expose/(\d+)",
+        r"expose-(\d+)",
+        r"/s-anzeige/.*?/(\d+)-",
+        r"/s-anzeige/.*?/(\d+)$",
+        r"/immobilie/(\d+)",
+        r"/objekt/(\d+)",
+        r"/angebot/(\d+)",
+        r"id=(\d+)",
+        r"objectid=(\d+)",
+        r"estate_id=(\d+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, lower)
+
+        if match:
+            return match.group(1)
+
     last_part = clean_url.split("/")[-1]
-
     match = re.search(r"(\d+)$", last_part)
+
     if match:
         return match.group(1)
 
-    match = re.search(r"expose/(\d+)", clean_url)
-    if match:
-        return match.group(1)
-
-    match = re.search(r"expose-(\d+)", clean_url)
-    if match:
-        return match.group(1)
-
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", clean_url.lower())
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", lower)
 
     return slug[-120:]
 
@@ -1044,6 +1086,14 @@ def evaluate_deal(price, area, location, title="", description="", commission_pe
 
 def scrape_kleinanzeigen_search_page(url):
     response = requests.get(url, headers=HEADERS, timeout=30)
+
+    print("Kleinanzeigen HTTP:", response.status_code, response.url)
+    print("HTML Länge:", len(response.text))
+
+    if "captcha" in response.text.lower() or "g-recaptcha" in response.text.lower():
+        print("WARNUNG: Kleinanzeigen blockt evtl. mit Captcha.")
+        return []
+
     response.raise_for_status()
 
     soup = make_soup(response.text)
@@ -1053,16 +1103,19 @@ def scrape_kleinanzeigen_search_page(url):
 
     ads = []
 
-    for article in soup.select("article.aditem"):
+    articles = soup.select("article.aditem")
+    print("article.aditem gefunden:", len(articles))
+
+    for article in articles:
         link_tag = (
             article.select_one("a.ellipsis")
             or article.select_one("a[href*='/s-anzeige/']")
+            or article.select_one("a[href*='/s-']")
         )
 
         if not link_tag:
             continue
 
-        title = clean_text(link_tag.get_text(" ", strip=True))
         href = link_tag.get("href")
 
         if not href:
@@ -1073,6 +1126,12 @@ def scrape_kleinanzeigen_search_page(url):
         if "/s-anzeige/" not in full_link:
             continue
 
+        title = clean_text(link_tag.get_text(" ", strip=True))
+
+        if not title:
+            title_tag = article.select_one("h2, h3")
+            title = clean_text(title_tag.get_text(" ", strip=True)) if title_tag else "Kleinanzeigen Angebot"
+
         raw_ad_id = extract_ad_id_from_url(full_link)
         ad_id = f"kleinanzeigen_{raw_ad_id}"
 
@@ -1082,14 +1141,15 @@ def scrape_kleinanzeigen_search_page(url):
         area = parse_area(article_text)
         rooms = parse_rooms(article_text)
 
-        location_tag = article.select_one(".aditem-main--top--left")
+        location_tag = (
+            article.select_one(".aditem-main--top--left")
+            or article.select_one("[class*='location']")
+        )
+
         location = clean_location(location_tag.get_text(" ", strip=True)) if location_tag else ""
 
         desc_tag = article.select_one(".aditem-main--middle--description")
         description = clean_text(desc_tag.get_text(" ", strip=True)) if desc_tag else article_text
-
-        if not title:
-            title = "Kleinanzeigen Angebot"
 
         ads.append({
             "id": ad_id,
@@ -1712,6 +1772,7 @@ def process_ads(ads, seen, new_seen):
 
             if should_skip_ad(ad):
                 new_seen.add(ad["id"])
+                save_seen(new_seen)
                 continue
 
             result = evaluate_deal(
@@ -1729,14 +1790,22 @@ def process_ads(ads, seen, new_seen):
             if INIT_MODE:
                 print(f"INIT gespeichert, nicht gesendet: {ad.get('platform')} | {ad.get('title')}")
                 new_seen.add(ad["id"])
+                save_seen(new_seen)
                 continue
 
             if result.get("score", 0) < MIN_SCORE_FOR_INSTANT_MESSAGE:
                 print(f"Nicht gesendet, Score zu niedrig: {result.get('score')} | {ad.get('title')}")
                 new_seen.add(ad["id"])
+                save_seen(new_seen)
                 continue
 
             message = format_message(ad, result)
+
+            # Wichtig:
+            # Die ID wird VOR Telegram gespeichert.
+            # Falls der Prozess nach dem Senden abbricht, wird das Angebot nicht erneut gesendet.
+            new_seen.add(ad["id"])
+            save_seen(new_seen)
 
             try:
                 send_telegram(message)
@@ -1744,16 +1813,16 @@ def process_ads(ads, seen, new_seen):
                 if PRIVATE_CHAT_ID:
                     send_telegram("🔔 <b>Neues Angebot:</b>\n\n" + message, chat_id=PRIVATE_CHAT_ID)
 
-                print(f"Gesendet: {ad.get('title')}")
-                new_seen.add(ad["id"])
+                print(f"Gesendet und gespeichert: {ad.get('title')}")
                 time.sleep(2)
 
             except Exception as e:
-                print(f"Telegram Fehler: {e}")
+                print(f"Telegram Fehler, aber ID wurde bereits gespeichert: {e}")
 
         except Exception as e:
             print(f"Anzeige übersprungen wegen Fehler: {ad.get('title')} | {e}")
             new_seen.add(ad["id"])
+            save_seen(new_seen)
             continue
 
 
@@ -1811,7 +1880,12 @@ def run_once():
 
     save_seen(new_seen)
 
-    print("\nGesehene Anzeigen nach Lauf:", len(new_seen))
+    print("\n" + "-" * 70)
+    print("Lauf beendet.")
+    print("Gesehene Anzeigen beim Start:", len(seen))
+    print("Neue gespeicherte Anzeigen:", len(new_seen) - len(seen))
+    print("Gesamt gespeicherte Anzeigen:", len(new_seen))
+    print("-" * 70)
 
     try:
         send_daily_summary_if_needed()
