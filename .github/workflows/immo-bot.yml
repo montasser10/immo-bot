@@ -53,8 +53,6 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git pull --rebase origin main
-
           git add seen_ads.json today_deals.json || true
           if [ -f last_summary.txt ]; then git add last_summary.txt; fi
 
@@ -62,5 +60,7 @@ jobs:
             echo "Keine Änderungen zu speichern."
           else
             git commit -m "Update immo bot cache"
+
+            git pull --rebase origin main
             git push origin main
           fi
